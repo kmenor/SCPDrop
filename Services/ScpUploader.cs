@@ -1,3 +1,4 @@
+using System.Text;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using SCPDrop.Models;
@@ -26,8 +27,11 @@ public static class ScpUploader
         Action<string> log,
         CancellationToken ct) => Task.Run(() =>
     {
-        var sizes = localPaths.Select(GetSize).ToArray();
-        long total = sizes.Sum();
+        var baseFolder = NormalizeRemoteFolder(conn.RemoteFolder);
+        var plan = BuildPlan(localPaths, baseFolder);
+        foreach (var skipped in plan.Skipped) log("Skipped " + skipped);
+        foreach (var item in plan.Items) log("Uploading " + item);
+        long total = plan.Files.Sum(f => f.Size);
         var auth = new AuthSession();
 
         SshClient? ssh = null;
@@ -52,52 +56,27 @@ public static class ScpUploader
 
         try
         {
-            var baseFolder = NormalizeRemoteFolder(conn.RemoteFolder);
             if (conn.CreateRemoteFolder && baseFolder.Length > 0)
-                RunChecked(Shell(), $"mkdir -p {ShellQuote(baseFolder)}");
+                RunChecked(Shell(), $"mkdir -p -- {ShellQuote(baseFolder)}");
+            if (plan.RemoteDirs.Count > 0)
+                RunBatched(Shell(), "mkdir -p --", plan.RemoteDirs, ct);
 
             Connect(scp, scpCheck, auth);
 
-            long itemBase = 0, intraDone = 0, curSize = 0, curUploaded = 0;
-            string? curName = null;
+            // Files are sent one at a time from our own walk of the tree; SSH.NET's recursive directory
+            // upload is not used because it would follow links out of the selected folder.
+            long done = 0;
+            var currentName = "";
             scp.Uploading += (_, e) =>
-            {
-                if (e.Filename != curName || e.Uploaded < curUploaded)
-                {
-                    if (curName != null) intraDone += curSize;
-                    curName = e.Filename;
-                    curSize = e.Size;
-                }
-                curUploaded = e.Uploaded;
-                progress.Report(new UploadProgress(e.Filename, Math.Min(total, itemBase + intraDone + e.Uploaded), total));
-            };
+                progress.Report(new UploadProgress(currentName, Math.Min(total, done + e.Uploaded), total));
 
-            for (int i = 0; i < localPaths.Count; i++)
+            foreach (var file in plan.Files)
             {
                 ct.ThrowIfCancellationRequested();
-                var local = localPaths[i];
-                var name = Path.GetFileName(local.TrimEnd('\\', '/'));
-                var remote = JoinRemote(baseFolder, name);
-                intraDone = 0; curName = null; curSize = 0; curUploaded = 0;
-
-                if (Directory.Exists(local))
-                {
-                    log($"Uploading folder {name} → {remote}/");
-                    RunChecked(Shell(), $"mkdir -p {ShellQuote(remote)}");
-                    scp.Upload(new DirectoryInfo(local), remote);
-                }
-                else if (File.Exists(local))
-                {
-                    log($"Uploading {name} ({FormatBytes(sizes[i])}) → {remote}");
-                    scp.Upload(new FileInfo(local), remote);
-                }
-                else
-                {
-                    log($"Skipped (not found): {local}");
-                }
-
-                itemBase += sizes[i];
-                progress.Report(new UploadProgress(name, itemBase, total));
+                currentName = file.DisplayName;
+                scp.Upload(new FileInfo(file.LocalPath), file.RemotePath);
+                done += file.Size;
+                progress.Report(new UploadProgress(file.DisplayName, done, total));
             }
         }
         catch (Exception) when (ct.IsCancellationRequested)
@@ -294,11 +273,103 @@ public static class ScpUploader
         }
     }
 
+    internal sealed record PlannedFile(string LocalPath, string RemotePath, string DisplayName, long Size);
+
+    internal sealed class UploadPlan
+    {
+        public List<PlannedFile> Files { get; } = new();
+
+        /// <summary>Remote directories to create, parents before children.</summary>
+        public List<string> RemoteDirs { get; } = new();
+
+        /// <summary>One human-readable line per dropped item.</summary>
+        public List<string> Items { get; } = new();
+
+        public List<string> Skipped { get; } = new();
+    }
+
+    /// <summary>
+    /// Expands the dropped items into the exact list of files and folders to send. Symbolic links and
+    /// junctions are never followed, whether dropped directly or found inside a folder, so nothing outside
+    /// the selected tree is uploaded and link cycles can't occur.
+    /// </summary>
+    internal static UploadPlan BuildPlan(IReadOnlyList<string> localPaths, string baseFolder)
+    {
+        var plan = new UploadPlan();
+        foreach (var raw in localPaths)
+        {
+            var local = Path.TrimEndingDirectorySeparator(raw);
+            FileSystemInfo entry = Directory.Exists(local) ? new DirectoryInfo(local) : new FileInfo(local);
+            if (!entry.Exists) { plan.Skipped.Add($"(not found): {raw}"); continue; }
+            if (IsLink(entry)) { plan.Skipped.Add($"(link not followed): {raw}"); continue; }
+            if (entry is DirectoryInfo { Parent: null }) { plan.Skipped.Add($"(drive root): {raw}"); continue; }
+
+            var remote = JoinRemote(baseFolder, entry.Name);
+            if (entry is DirectoryInfo dir)
+            {
+                var firstFile = plan.Files.Count;
+                AddDirectory(plan, dir, remote, dir.Name);
+                var added = plan.Files.Skip(firstFile).ToList();
+                plan.Items.Add($"folder {dir.Name} → {remote}/ ({added.Count} files, {FormatBytes(added.Sum(f => f.Size))})");
+            }
+            else
+            {
+                var file = (FileInfo)entry;
+                plan.Files.Add(new PlannedFile(file.FullName, remote, file.Name, file.Length));
+                plan.Items.Add($"{file.Name} ({FormatBytes(file.Length)}) → {remote}");
+            }
+        }
+        return plan;
+    }
+
+    private static void AddDirectory(UploadPlan plan, DirectoryInfo dir, string remote, string display)
+    {
+        plan.RemoteDirs.Add(remote);
+        foreach (var entry in dir.EnumerateFileSystemInfos())
+        {
+            if (IsLink(entry)) { plan.Skipped.Add($"(link not followed): {entry.FullName}"); continue; }
+            var childRemote = remote + "/" + entry.Name;
+            var childDisplay = display + "/" + entry.Name;
+            if (entry is DirectoryInfo sub) AddDirectory(plan, sub, childRemote, childDisplay);
+            else if (entry is FileInfo file) plan.Files.Add(new PlannedFile(file.FullName, childRemote, childDisplay, file.Length));
+        }
+    }
+
+    /// <summary>
+    /// Symbolic links and junctions. Cloud placeholders (e.g. OneDrive) are reparse points too but have no
+    /// link target, so they are treated as ordinary files.
+    /// </summary>
+    private static bool IsLink(FileSystemInfo entry) => entry.LinkTarget != null;
+
     private static void RunChecked(SshClient ssh, string command)
     {
         var r = ssh.RunCommand(command);
         if (r.ExitStatus != 0)
-            throw new InvalidOperationException($"Remote command failed ({command}): {r.Error.Trim()}");
+        {
+            var shown = command.Length > 200 ? command[..200] + "…" : command;
+            throw new InvalidOperationException($"Remote command failed ({shown}): {r.Error.Trim()}");
+        }
+    }
+
+    /// <summary>Runs "command arg1 arg2 ..." in as few invocations as the command-line length allows.</summary>
+    private static void RunBatched(SshClient ssh, string command, IEnumerable<string> args, CancellationToken ct)
+    {
+        const int maxLength = 16 * 1024;
+        var batch = new StringBuilder(command);
+        var hasArgs = false;
+        foreach (var arg in args)
+        {
+            var quoted = " " + ShellQuote(arg);
+            if (hasArgs && batch.Length + quoted.Length > maxLength)
+            {
+                ct.ThrowIfCancellationRequested();
+                RunChecked(ssh, batch.ToString());
+                batch.Clear().Append(command);
+            }
+            batch.Append(quoted);
+            hasArgs = true;
+        }
+        if (hasArgs) RunChecked(ssh, batch.ToString());
     }
 
     /// <summary>scp/ssh commands start in the login's home dir, so "~/x" becomes "x" (quoting would stop ~ expanding).</summary>
@@ -314,18 +385,6 @@ public static class ScpUploader
         folder.Length == 0 ? name : folder == "/" ? "/" + name : folder + "/" + name;
 
     private static string ShellQuote(string s) => "'" + s.Replace("'", "'\"'\"'") + "'";
-
-    private static long GetSize(string path)
-    {
-        try
-        {
-            if (File.Exists(path)) return new FileInfo(path).Length;
-            if (Directory.Exists(path))
-                return new DirectoryInfo(path).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length);
-        }
-        catch { /* best effort */ }
-        return 0;
-    }
 
     public static string FormatBytes(long bytes)
     {
