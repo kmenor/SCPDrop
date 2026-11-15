@@ -15,6 +15,9 @@ public interface IConnectionUi
 
     /// <summary>Server asked a keyboard-interactive question we can't answer (2FA code, password retry, ...). Null = cancel.</summary>
     string? Ask(RemoteConnection connection, string instruction, string request, bool echo);
+
+    /// <summary>Some destination files already exist on the server: return true to replace them.</summary>
+    bool ConfirmOverwrite(RemoteConnection connection, IReadOnlyList<string> existingPaths);
 }
 
 public static class ScpUploader
@@ -34,32 +37,29 @@ public static class ScpUploader
         long total = plan.Files.Sum(f => f.Size);
         var auth = new AuthSession();
 
-        SshClient? ssh = null;
+        // The shell connection checks for existing files, creates folders and renames finished uploads.
+        using var ssh = new SshClient(BuildConnectionInfo(conn, ui, auth));
+        var sshCheck = AttachHostKeyCheck(ssh, conn, ui);
         using var scp = new ScpClient(BuildConnectionInfo(conn, ui, auth), RemotePathTransformation.ShellQuote);
         var scpCheck = AttachHostKeyCheck(scp, conn, ui);
 
+        // Cancelling aborts the transfer only; the shell connection stays up long enough to delete the
+        // partial temp file.
         using var reg = ct.Register(() =>
         {
             try { scp.Disconnect(); } catch { /* ignore */ }
-            try { ssh?.Disconnect(); } catch { /* ignore */ }
         });
-
-        // The shell connection is only opened if we need to run mkdir.
-        SshClient Shell()
-        {
-            if (ssh != null) return ssh;
-            ssh = new SshClient(BuildConnectionInfo(conn, ui, auth));
-            var check = AttachHostKeyCheck(ssh, conn, ui);
-            Connect(ssh, check, auth);
-            return ssh;
-        }
 
         try
         {
+            Connect(ssh, sshCheck, auth);
+            ConfirmDestinations(ssh, conn, plan, ui, ct);
+
             if (conn.CreateRemoteFolder && baseFolder.Length > 0)
-                RunChecked(Shell(), $"mkdir -p -- {ShellQuote(baseFolder)}");
+                RunChecked(ssh, $"mkdir -p -- {ShellQuote(baseFolder)}");
             if (plan.RemoteDirs.Count > 0)
-                RunBatched(Shell(), "mkdir -p --", plan.RemoteDirs, ct);
+                RunBatched(ssh, "mkdir -p --", plan.RemoteDirs, ct);
+            RemoveStaleTempFiles(ssh, plan);
 
             Connect(scp, scpCheck, auth);
 
@@ -74,7 +74,7 @@ public static class ScpUploader
             {
                 ct.ThrowIfCancellationRequested();
                 currentName = file.DisplayName;
-                scp.Upload(new FileInfo(file.LocalPath), file.RemotePath);
+                UploadViaTempFile(ssh, scp, file);
                 done += file.Size;
                 progress.Report(new UploadProgress(file.DisplayName, done, total));
             }
@@ -86,10 +86,105 @@ public static class ScpUploader
         finally
         {
             if (scp.IsConnected) scp.Disconnect();
-            if (ssh is { IsConnected: true }) ssh.Disconnect();
-            ssh?.Dispose();
+            if (ssh.IsConnected) ssh.Disconnect();
         }
     }, ct);
+
+    private const string TempPrefix = ".scpdrop-";
+    private const string TempSuffix = ".part";
+
+    /// <summary>
+    /// Sends the file to a uniquely named temp file next to its destination, then renames it into place.
+    /// The rename is atomic, so an interrupted transfer never leaves a truncated file under the real name.
+    /// </summary>
+    private static void UploadViaTempFile(SshClient ssh, ScpClient scp, PlannedFile file)
+    {
+        var slash = file.RemotePath.LastIndexOf('/');
+        var dirPrefix = slash < 0 ? "" : file.RemotePath[..(slash + 1)];
+        var temp = $"{dirPrefix}{TempPrefix}{Guid.NewGuid():N}{TempSuffix}";
+        try
+        {
+            scp.Upload(new FileInfo(file.LocalPath), temp);
+            var target = ShellQuote(file.RemotePath);
+            // mv into an existing directory would move the file *inside* it, so refuse that explicitly.
+            RunChecked(ssh,
+                $"if [ -d {target} ]; then echo 'a folder with this name exists' >&2; exit 1; fi; " +
+                $"mv -f -- {ShellQuote(temp)} {target}");
+        }
+        catch
+        {
+            try
+            {
+                if (ssh.IsConnected) ssh.RunCommand($"rm -f -- {ShellQuote(temp)}");
+            }
+            catch { /* best effort; stale temp files are also swept on later uploads */ }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Fails if a file would land on an existing folder (or a folder on an existing file), and asks before
+    /// replacing existing files. Runs before anything is created or uploaded.
+    /// </summary>
+    private static void ConfirmDestinations(SshClient ssh, RemoteConnection conn, UploadPlan plan, IConnectionUi ui, CancellationToken ct)
+    {
+        var plannedDirs = new HashSet<string>(plan.RemoteDirs, StringComparer.Ordinal);
+        var existing = FindExisting(ssh, plan.RemoteDirs.Concat(plan.Files.Select(f => f.RemotePath)), ct);
+
+        var blocked = existing
+            .Where(e => e.IsDirectory != plannedDirs.Contains(e.Path))
+            .Select(e => e.IsDirectory ? $"{e.Path} (a folder exists there)" : $"{e.Path} (a file exists there)")
+            .ToList();
+        if (blocked.Count > 0)
+            throw new InvalidOperationException(
+                "Nothing was uploaded. These destinations already exist as the wrong type: " +
+                string.Join(", ", blocked.Take(5)) + (blocked.Count > 5 ? $" and {blocked.Count - 5} more" : ""));
+
+        var overwrites = existing.Where(e => !e.IsDirectory).Select(e => e.Path).ToList();
+        if (overwrites.Count > 0 && !ui.ConfirmOverwrite(conn, overwrites))
+            throw new InvalidOperationException(
+                $"Nothing was uploaded: {overwrites.Count} file(s) already exist on the server and replacing them was declined.");
+    }
+
+    private static List<(string Path, bool IsDirectory)> FindExisting(SshClient ssh, IEnumerable<string> paths, CancellationToken ct)
+    {
+        var found = new List<(string, bool)>();
+        foreach (var batch in QuotedBatches(paths))
+        {
+            ct.ThrowIfCancellationRequested();
+            // NUL-separated output so any file name round-trips.
+            var r = ssh.RunCommand(
+                $"for p in {batch}; do " +
+                "if [ -d \"$p\" ]; then printf 'D%s\\0' \"$p\"; " +
+                "elif [ -e \"$p\" ] || [ -L \"$p\" ]; then printf 'F%s\\0' \"$p\"; fi; done");
+            if (r.ExitStatus != 0)
+                throw new InvalidOperationException($"Could not check the destination on the server: {r.Error.Trim()}");
+            foreach (var entry in r.Result.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+                found.Add((entry[1..], entry[0] == 'D'));
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// Deletes temp files left by uploads that were killed outright (crash, power loss) in the folders we're
+    /// about to write to. Only files older than a day are removed, so another upload in progress is untouched.
+    /// </summary>
+    private static void RemoveStaleTempFiles(SshClient ssh, UploadPlan plan)
+    {
+        var dirs = plan.Files
+            .Select(f => f.RemotePath.LastIndexOf('/') switch { < 0 => ".", 0 => "/", var i => f.RemotePath[..i] })
+            .Distinct(StringComparer.Ordinal);
+        foreach (var batch in QuotedBatches(dirs))
+        {
+            try
+            {
+                ssh.RunCommand(
+                    $"for d in {batch}; do find \"$d\" -maxdepth 1 -type f -name '{TempPrefix}*{TempSuffix}' " +
+                    "-mmin +1440 -exec rm -f -- {} + ; done 2>/dev/null; true");
+            }
+            catch { /* housekeeping only */ }
+        }
+    }
 
     /// <summary>Connects, verifies login and checks the remote folder. Returns a human-readable summary.</summary>
     public static string Test(RemoteConnection conn, IConnectionUi ui)
@@ -296,6 +391,7 @@ public static class ScpUploader
     internal static UploadPlan BuildPlan(IReadOnlyList<string> localPaths, string baseFolder)
     {
         var plan = new UploadPlan();
+        var targets = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var raw in localPaths)
         {
             var local = Path.TrimEndingDirectorySeparator(raw);
@@ -305,6 +401,12 @@ public static class ScpUploader
             if (entry is DirectoryInfo { Parent: null }) { plan.Skipped.Add($"(drive root): {raw}"); continue; }
 
             var remote = JoinRemote(baseFolder, entry.Name);
+            if (targets.TryGetValue(remote, out var other))
+                throw new InvalidOperationException(
+                    $"Nothing was uploaded: \"{other}\" and \"{entry.FullName}\" would both be uploaded to {remote}. " +
+                    "Upload them separately or rename one.");
+            targets[remote] = entry.FullName;
+
             if (entry is DirectoryInfo dir)
             {
                 var firstFile = plan.Files.Count;
@@ -354,22 +456,30 @@ public static class ScpUploader
     /// <summary>Runs "command arg1 arg2 ..." in as few invocations as the command-line length allows.</summary>
     private static void RunBatched(SshClient ssh, string command, IEnumerable<string> args, CancellationToken ct)
     {
+        foreach (var batch in QuotedBatches(args))
+        {
+            ct.ThrowIfCancellationRequested();
+            RunChecked(ssh, $"{command} {batch}");
+        }
+    }
+
+    /// <summary>Shell-quotes the arguments and joins them into space-separated chunks of bounded length.</summary>
+    private static IEnumerable<string> QuotedBatches(IEnumerable<string> args)
+    {
         const int maxLength = 16 * 1024;
-        var batch = new StringBuilder(command);
-        var hasArgs = false;
+        var batch = new StringBuilder();
         foreach (var arg in args)
         {
-            var quoted = " " + ShellQuote(arg);
-            if (hasArgs && batch.Length + quoted.Length > maxLength)
+            var quoted = ShellQuote(arg);
+            if (batch.Length > 0 && batch.Length + 1 + quoted.Length > maxLength)
             {
-                ct.ThrowIfCancellationRequested();
-                RunChecked(ssh, batch.ToString());
-                batch.Clear().Append(command);
+                yield return batch.ToString();
+                batch.Clear();
             }
+            if (batch.Length > 0) batch.Append(' ');
             batch.Append(quoted);
-            hasArgs = true;
         }
-        if (hasArgs) RunChecked(ssh, batch.ToString());
+        if (batch.Length > 0) yield return batch.ToString();
     }
 
     /// <summary>scp/ssh commands start in the login's home dir, so "~/x" becomes "x" (quoting would stop ~ expanding).</summary>

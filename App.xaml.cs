@@ -29,6 +29,18 @@ public sealed class WpfConnectionUi(Window owner, Action? onHostKeyTrusted = nul
 
     public string? Ask(RemoteConnection conn, string instruction, string request, bool echo) =>
         owner.Dispatcher.Invoke(() => PromptDialog.Ask(owner, $"{conn.Username}@{conn.Host}", instruction, request, echo));
+
+    public bool ConfirmOverwrite(RemoteConnection conn, IReadOnlyList<string> existingPaths) =>
+        owner.Dispatcher.Invoke(() =>
+        {
+            const int shown = 10;
+            var list = string.Join("\n", existingPaths.Take(shown));
+            var more = existingPaths.Count > shown ? $"\n…and {existingPaths.Count - shown} more" : "";
+            return MessageBox.Show(owner,
+                $"{existingPaths.Count} file(s) already exist on {conn.Host}:\n\n{list}{more}\n\nReplace them?",
+                "Files already exist", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No)
+                == MessageBoxResult.Yes;
+        });
 }
 
 /// <summary>Minimal input dialog for keyboard-interactive prompts (password retry, 2FA code, ...).</summary>

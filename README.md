@@ -19,6 +19,16 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 3. Pick the connection in **Send to:** and drop files/folders onto the drop zone (or use the Browse buttons).
    Folders are copied recursively as `<remote folder>/<folder name>/...`. Multiple drops queue up and run in order.
 
+**How files are written**
+- Symbolic links and junctions are never followed (dropped directly or inside a folder); they're skipped and
+  logged, so nothing outside the selected folder is sent.
+- Each file is uploaded as a hidden `.scpdrop-<id>.part` temp file in its destination folder and renamed into
+  place only once complete, so a failed or cancelled transfer never leaves a truncated file under the real name.
+  Leftover temp files older than a day are cleaned up on later uploads to the same folder.
+- If any destination files already exist you're asked once whether to replace them; declining uploads nothing.
+  A replaced file gets the uploaded file's permissions (0644), not the old file's.
+- Dropping two items with the same name (e.g. `a\report.txt` and `b\report.txt`) is refused up front.
+
 **Remote folder**: absolute (`/srv/drop`) or home-relative (`uploads`, `~/uploads`); blank = home directory.
 With "Create remote folder" checked, `mkdir -p` runs before upload.
 
