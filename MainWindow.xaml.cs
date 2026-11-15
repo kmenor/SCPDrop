@@ -11,6 +11,7 @@ public partial class MainWindow : Window
     private AppConfig _config;
     private readonly SemaphoreSlim _uploadGate = new(1, 1);
     private CancellationTokenSource? _cts;
+    private Task? _cancelling;
     private int _queued;
     private bool _loading;
 
@@ -161,6 +162,9 @@ public partial class MainWindow : Window
         }
         finally
         {
+            // The source can only be disposed once its cancellation callbacks have finished.
+            if (_cancelling != null) await _cancelling;
+            _cancelling = null;
             _cts.Dispose();
             _cts = null;
             Interlocked.Decrement(ref _queued);
@@ -176,7 +180,14 @@ public partial class MainWindow : Window
         ConnectionCombo.IsEnabled = !busy;
     }
 
-    private void Cancel_Click(object sender, RoutedEventArgs e) => _cts?.Cancel();
+    private void Cancel_Click(object sender, RoutedEventArgs e)
+    {
+        if (_cts == null || _cts.IsCancellationRequested) return;
+        StatusText.Text = "Cancelling…";
+        CancelButton.IsEnabled = false;
+        // CancelAsync runs the cancellation callbacks (dropping the SCP connection etc.) off the UI thread.
+        _cancelling = _cts.CancelAsync();
+    }
 
     // ---- Misc ----
 

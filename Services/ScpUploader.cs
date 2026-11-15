@@ -31,7 +31,7 @@ public static class ScpUploader
         CancellationToken ct) => Task.Run(() =>
     {
         var baseFolder = NormalizeRemoteFolder(conn.RemoteFolder);
-        var plan = BuildPlan(localPaths, baseFolder);
+        var plan = BuildPlan(localPaths, baseFolder, ct);
         foreach (var skipped in plan.Skipped) log("Skipped " + skipped);
         foreach (var item in plan.Items) log("Uploading " + item);
         long total = plan.Files.Sum(f => f.Size);
@@ -40,10 +40,14 @@ public static class ScpUploader
         // The shell connection checks for existing files, creates folders and renames finished uploads.
         using var ssh = new SshClient(BuildConnectionInfo(conn, ui, auth));
         var sshCheck = AttachHostKeyCheck(ssh, conn, ui);
-        using var scp = new ScpClient(BuildConnectionInfo(conn, ui, auth), RemotePathTransformation.ShellQuote);
+        using var scp = new ScpClient(BuildConnectionInfo(conn, ui, auth), RemotePathTransformation.ShellQuote)
+        {
+            OperationTimeout = ScpOperationTimeout
+        };
         var scpCheck = AttachHostKeyCheck(scp, conn, ui);
 
-        // Cancelling aborts the transfer only; the shell connection stays up long enough to delete the
+        // SCP transfers have no cancellable API, so cancelling drops the SCP connection. Connecting and remote
+        // commands take the token directly, which leaves the shell connection usable for deleting the
         // partial temp file.
         using var reg = ct.Register(() =>
         {
@@ -52,16 +56,16 @@ public static class ScpUploader
 
         try
         {
-            Connect(ssh, sshCheck, auth);
+            Connect(ssh, sshCheck, auth, ct);
             ConfirmDestinations(ssh, conn, plan, ui, ct);
 
             if (conn.CreateRemoteFolder && baseFolder.Length > 0)
-                RunChecked(ssh, $"mkdir -p -- {ShellQuote(baseFolder)}");
+                RunChecked(ssh, $"mkdir -p -- {ShellQuote(baseFolder)}", ct);
             if (plan.RemoteDirs.Count > 0)
                 RunBatched(ssh, "mkdir -p --", plan.RemoteDirs, ct);
-            RemoveStaleTempFiles(ssh, plan);
+            RemoveStaleTempFiles(ssh, plan, ct);
 
-            Connect(scp, scpCheck, auth);
+            Connect(scp, scpCheck, auth, ct);
 
             // Files are sent one at a time from our own walk of the tree; SSH.NET's recursive directory
             // upload is not used because it would follow links out of the selected folder.
@@ -74,7 +78,7 @@ public static class ScpUploader
             {
                 ct.ThrowIfCancellationRequested();
                 currentName = file.DisplayName;
-                UploadViaTempFile(ssh, scp, file);
+                UploadViaTempFile(ssh, scp, file, ct);
                 done += file.Size;
                 progress.Report(new UploadProgress(file.DisplayName, done, total));
             }
@@ -93,11 +97,17 @@ public static class ScpUploader
     private const string TempPrefix = ".scpdrop-";
     private const string TempSuffix = ".part";
 
+    /// <summary>Longest wait for any single remote command (mkdir, existence check, rename, cleanup).</summary>
+    private static readonly TimeSpan RemoteCommandTimeout = TimeSpan.FromMinutes(2);
+
+    /// <summary>Longest wait for the remote scp to acknowledge a step; data transfer itself isn't limited.</summary>
+    private static readonly TimeSpan ScpOperationTimeout = TimeSpan.FromMinutes(2);
+
     /// <summary>
     /// Sends the file to a uniquely named temp file next to its destination, then renames it into place.
     /// The rename is atomic, so an interrupted transfer never leaves a truncated file under the real name.
     /// </summary>
-    private static void UploadViaTempFile(SshClient ssh, ScpClient scp, PlannedFile file)
+    private static void UploadViaTempFile(SshClient ssh, ScpClient scp, PlannedFile file, CancellationToken ct)
     {
         var slash = file.RemotePath.LastIndexOf('/');
         var dirPrefix = slash < 0 ? "" : file.RemotePath[..(slash + 1)];
@@ -109,13 +119,14 @@ public static class ScpUploader
             // mv into an existing directory would move the file *inside* it, so refuse that explicitly.
             RunChecked(ssh,
                 $"if [ -d {target} ]; then echo 'a folder with this name exists' >&2; exit 1; fi; " +
-                $"mv -f -- {ShellQuote(temp)} {target}");
+                $"mv -f -- {ShellQuote(temp)} {target}", ct);
         }
         catch
         {
             try
             {
-                if (ssh.IsConnected) ssh.RunCommand($"rm -f -- {ShellQuote(temp)}");
+                // Not tied to the (possibly cancelled) token: this cleanup must still run after a cancel.
+                if (ssh.IsConnected) Exec(ssh, $"rm -f -- {ShellQuote(temp)}", CancellationToken.None);
             }
             catch { /* best effort; stale temp files are also swept on later uploads */ }
             throw;
@@ -151,15 +162,14 @@ public static class ScpUploader
         var found = new List<(string, bool)>();
         foreach (var batch in QuotedBatches(paths))
         {
-            ct.ThrowIfCancellationRequested();
             // NUL-separated output so any file name round-trips.
-            var r = ssh.RunCommand(
+            var r = Exec(ssh,
                 $"for p in {batch}; do " +
                 "if [ -d \"$p\" ]; then printf 'D%s\\0' \"$p\"; " +
-                "elif [ -e \"$p\" ] || [ -L \"$p\" ]; then printf 'F%s\\0' \"$p\"; fi; done");
+                "elif [ -e \"$p\" ] || [ -L \"$p\" ]; then printf 'F%s\\0' \"$p\"; fi; done", ct);
             if (r.ExitStatus != 0)
                 throw new InvalidOperationException($"Could not check the destination on the server: {r.Error.Trim()}");
-            foreach (var entry in r.Result.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+            foreach (var entry in r.Output.Split('\0', StringSplitOptions.RemoveEmptyEntries))
                 found.Add((entry[1..], entry[0] == 'D'));
         }
         return found;
@@ -169,7 +179,7 @@ public static class ScpUploader
     /// Deletes temp files left by uploads that were killed outright (crash, power loss) in the folders we're
     /// about to write to. Only files older than a day are removed, so another upload in progress is untouched.
     /// </summary>
-    private static void RemoveStaleTempFiles(SshClient ssh, UploadPlan plan)
+    private static void RemoveStaleTempFiles(SshClient ssh, UploadPlan plan, CancellationToken ct)
     {
         var dirs = plan.Files
             .Select(f => f.RemotePath.LastIndexOf('/') switch { < 0 => ".", 0 => "/", var i => f.RemotePath[..i] })
@@ -178,11 +188,11 @@ public static class ScpUploader
         {
             try
             {
-                ssh.RunCommand(
+                Exec(ssh,
                     $"for d in {batch}; do find \"$d\" -maxdepth 1 -type f -name '{TempPrefix}*{TempSuffix}' " +
-                    "-mmin +1440 -exec rm -f -- {} + ; done 2>/dev/null; true");
+                    "-mmin +1440 -exec rm -f -- {} + ; done 2>/dev/null; true", ct);
             }
-            catch { /* housekeeping only */ }
+            catch (Exception) when (!ct.IsCancellationRequested) { /* housekeeping only */ }
         }
     }
 
@@ -192,7 +202,7 @@ public static class ScpUploader
         var auth = new AuthSession();
         using var ssh = new SshClient(BuildConnectionInfo(conn, ui, auth));
         var check = AttachHostKeyCheck(ssh, conn, ui);
-        Connect(ssh, check, auth);
+        Connect(ssh, check, auth, CancellationToken.None);
         try
         {
             var lines = new List<string> { $"Connected and authenticated to {conn.Host}:{conn.Port} as {conn.Username}." };
@@ -202,8 +212,8 @@ public static class ScpUploader
             var folder = NormalizeRemoteFolder(conn.RemoteFolder);
             if (folder.Length > 0)
             {
-                var r = ssh.RunCommand($"test -d {ShellQuote(folder)} && echo EXISTS || echo MISSING");
-                lines.Add(r.Result.Trim() switch
+                var r = Exec(ssh, $"test -d {ShellQuote(folder)} && echo EXISTS || echo MISSING", CancellationToken.None);
+                lines.Add(r.Output.Trim() switch
                 {
                     "EXISTS" => $"Remote folder '{conn.RemoteFolder}' exists.",
                     "MISSING" => conn.CreateRemoteFolder
@@ -212,10 +222,10 @@ public static class ScpUploader
                     _ => "Could not check the remote folder (non-POSIX shell?)."
                 });
             }
-            var scpCheck = ssh.RunCommand("command -v scp");
-            lines.Add(string.IsNullOrWhiteSpace(scpCheck.Result)
+            var scpCheck = Exec(ssh, "command -v scp", CancellationToken.None);
+            lines.Add(string.IsNullOrWhiteSpace(scpCheck.Output)
                 ? "WARNING: 'scp' was not found on the remote PATH; uploads may fail."
-                : $"Remote scp: {scpCheck.Result.Trim()}");
+                : $"Remote scp: {scpCheck.Output.Trim()}");
             return string.Join(Environment.NewLine, lines);
         }
         finally
@@ -342,11 +352,12 @@ public static class ScpUploader
         return check;
     }
 
-    private static void Connect(BaseClient client, HostKeyCheck check, AuthSession auth)
+    private static void Connect(BaseClient client, HostKeyCheck check, AuthSession auth, CancellationToken ct)
     {
         try
         {
-            client.Connect();
+            // Bounded by ConnectionInfo.Timeout, and abandoned promptly if the user cancels.
+            client.ConnectAsync(ct).GetAwaiter().GetResult();
         }
         catch (SshConnectionException) when (check.RejectedReason != null)
         {
@@ -388,12 +399,13 @@ public static class ScpUploader
     /// junctions are never followed, whether dropped directly or found inside a folder, so nothing outside
     /// the selected tree is uploaded and link cycles can't occur.
     /// </summary>
-    internal static UploadPlan BuildPlan(IReadOnlyList<string> localPaths, string baseFolder)
+    internal static UploadPlan BuildPlan(IReadOnlyList<string> localPaths, string baseFolder, CancellationToken ct)
     {
         var plan = new UploadPlan();
         var targets = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var raw in localPaths)
         {
+            ct.ThrowIfCancellationRequested();
             var local = Path.TrimEndingDirectorySeparator(raw);
             FileSystemInfo entry = Directory.Exists(local) ? new DirectoryInfo(local) : new FileInfo(local);
             if (!entry.Exists) { plan.Skipped.Add($"(not found): {raw}"); continue; }
@@ -410,7 +422,7 @@ public static class ScpUploader
             if (entry is DirectoryInfo dir)
             {
                 var firstFile = plan.Files.Count;
-                AddDirectory(plan, dir, remote, dir.Name);
+                AddDirectory(plan, dir, remote, dir.Name, ct);
                 var added = plan.Files.Skip(firstFile).ToList();
                 plan.Items.Add($"folder {dir.Name} → {remote}/ ({added.Count} files, {FormatBytes(added.Sum(f => f.Size))})");
             }
@@ -424,15 +436,16 @@ public static class ScpUploader
         return plan;
     }
 
-    private static void AddDirectory(UploadPlan plan, DirectoryInfo dir, string remote, string display)
+    private static void AddDirectory(UploadPlan plan, DirectoryInfo dir, string remote, string display, CancellationToken ct)
     {
         plan.RemoteDirs.Add(remote);
         foreach (var entry in dir.EnumerateFileSystemInfos())
         {
+            ct.ThrowIfCancellationRequested();
             if (IsLink(entry)) { plan.Skipped.Add($"(link not followed): {entry.FullName}"); continue; }
             var childRemote = remote + "/" + entry.Name;
             var childDisplay = display + "/" + entry.Name;
-            if (entry is DirectoryInfo sub) AddDirectory(plan, sub, childRemote, childDisplay);
+            if (entry is DirectoryInfo sub) AddDirectory(plan, sub, childRemote, childDisplay, ct);
             else if (entry is FileInfo file) plan.Files.Add(new PlannedFile(file.FullName, childRemote, childDisplay, file.Length));
         }
     }
@@ -443,24 +456,43 @@ public static class ScpUploader
     /// </summary>
     private static bool IsLink(FileSystemInfo entry) => entry.LinkTarget != null;
 
-    private static void RunChecked(SshClient ssh, string command)
+    private sealed record CommandResult(int? ExitStatus, string Output, string Error);
+
+    /// <summary>
+    /// Runs a remote command with a finite timeout. Cancelling the token signals the remote command to stop
+    /// and throws <see cref="OperationCanceledException"/>.
+    /// </summary>
+    private static CommandResult Exec(SshClient ssh, string command, CancellationToken ct)
     {
-        var r = ssh.RunCommand(command);
-        if (r.ExitStatus != 0)
+        ct.ThrowIfCancellationRequested();
+        using var cmd = ssh.CreateCommand(command);
+        cmd.CommandTimeout = RemoteCommandTimeout;
+        try
         {
-            var shown = command.Length > 200 ? command[..200] + "…" : command;
-            throw new InvalidOperationException($"Remote command failed ({shown}): {r.Error.Trim()}");
+            cmd.ExecuteAsync(ct).GetAwaiter().GetResult();
         }
+        catch (SshOperationTimeoutException)
+        {
+            throw new TimeoutException(
+                $"The server did not finish ({Shorten(command)}) within {RemoteCommandTimeout.TotalMinutes:0} minutes.");
+        }
+        return new CommandResult(cmd.ExitStatus, cmd.Result, cmd.Error);
     }
+
+    private static void RunChecked(SshClient ssh, string command, CancellationToken ct)
+    {
+        var r = Exec(ssh, command, ct);
+        if (r.ExitStatus != 0)
+            throw new InvalidOperationException($"Remote command failed ({Shorten(command)}): {r.Error.Trim()}");
+    }
+
+    private static string Shorten(string command) => command.Length > 200 ? command[..200] + "…" : command;
 
     /// <summary>Runs "command arg1 arg2 ..." in as few invocations as the command-line length allows.</summary>
     private static void RunBatched(SshClient ssh, string command, IEnumerable<string> args, CancellationToken ct)
     {
         foreach (var batch in QuotedBatches(args))
-        {
-            ct.ThrowIfCancellationRequested();
-            RunChecked(ssh, $"{command} {batch}");
-        }
+            RunChecked(ssh, $"{command} {batch}", ct);
     }
 
     /// <summary>Shell-quotes the arguments and joins them into space-separated chunks of bounded length.</summary>
