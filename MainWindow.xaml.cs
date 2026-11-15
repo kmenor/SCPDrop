@@ -14,6 +14,8 @@ public partial class MainWindow : Window
     private Task? _cancelling;
     private int _queued;
     private bool _loading;
+    private bool _managing;
+    private readonly List<string> _pendingExternal = new();
 
     public MainWindow()
     {
@@ -25,10 +27,27 @@ public partial class MainWindow : Window
         _loading = false;
         RefreshConnections();
         Log($"Config: {ConfigStore.FilePath}");
+    }
 
-        // Paths passed on the command line (e.g. via a shortcut in shell:sendto) are uploaded on start.
-        var args = Environment.GetCommandLineArgs().Skip(1).Where(a => File.Exists(a) || Directory.Exists(a)).ToArray();
-        if (args.Length > 0) Loaded += async (_, _) => await UploadAsync(args);
+    /// <summary>
+    /// Paths from this process's command line or forwarded from a later launch (e.g. the Send To menu).
+    /// Brings the window forward and queues them for upload.
+    /// </summary>
+    public void HandleExternalPaths(string[] args)
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Activate();
+
+        var paths = args.Where(a => File.Exists(a) || Directory.Exists(a)).ToArray();
+        if (paths.Length == 0) return;
+        if (_managing)
+        {
+            // Connections are being edited; start once the editor closes so the upload uses the saved profile.
+            _pendingExternal.AddRange(paths);
+            Log($"Received {paths.Length} item(s); they'll upload when Manage Connections is closed.");
+            return;
+        }
+        _ = UploadAsync(paths);
     }
 
     private RemoteConnection? Selected => ConnectionCombo.SelectedItem as RemoteConnection;
@@ -64,11 +83,24 @@ public partial class MainWindow : Window
     private void Manage_Click(object sender, RoutedEventArgs e)
     {
         var win = new ConnectionsWindow(_config.Connections, Selected?.Id) { Owner = this };
-        if (win.ShowDialog() != true) return;
-        _config.Connections = win.Connections;
-        if (win.SelectedId != null) _config.LastSelectedId = win.SelectedId;
-        SaveConfig();
-        RefreshConnections();
+        _managing = true;
+        bool saved;
+        try { saved = win.ShowDialog() == true; }
+        finally { _managing = false; }
+        if (saved)
+        {
+            _config.Connections = win.Connections;
+            if (win.SelectedId != null) _config.LastSelectedId = win.SelectedId;
+            SaveConfig();
+            RefreshConnections();
+        }
+
+        if (_pendingExternal.Count > 0)
+        {
+            var pending = _pendingExternal.ToArray();
+            _pendingExternal.Clear();
+            _ = UploadAsync(pending);
+        }
     }
 
     // ---- Drag & drop ----

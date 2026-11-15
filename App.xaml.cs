@@ -7,6 +7,35 @@ namespace SCPDrop;
 
 public partial class App : Application
 {
+    private SingleInstance? _instance;
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+
+        _instance = SingleInstance.TryAcquire();
+        if (_instance == null)
+        {
+            // Another SCP Drop is running and owns the settings: hand it our paths (or just bring it forward).
+            if (!SingleInstance.TrySend(e.Args))
+                MessageBox.Show("SCP Drop is already running but didn't respond. Try again in a moment.",
+                    "SCP Drop", MessageBoxButton.OK, MessageBoxImage.Warning);
+            Shutdown();
+            return;
+        }
+
+        var window = new MainWindow();
+        MainWindow = window;
+        window.Show();
+        window.HandleExternalPaths(e.Args);
+        _ = _instance.ListenAsync(window.HandleExternalPaths);
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        _instance?.Dispose();
+        base.OnExit(e);
+    }
 }
 
 /// <summary>Shows host-key and keyboard-interactive prompts over a window; safe to call from any thread.</summary>

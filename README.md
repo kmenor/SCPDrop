@@ -35,6 +35,9 @@ With "Create remote folder" checked, `mkdir -p` runs before upload.
 **Send To menu** (optional): paths passed on the command line are uploaded to the last-selected connection on
 start. Put a shortcut to `SCPDrop.exe` in `shell:sendto` to get *Right-click → Send to → SCP Drop*.
 
+Only one SCP Drop runs per Windows user. Launching it again (including via Send To) hands the paths to the
+window that's already open, where they join the upload queue, and the new launch exits.
+
 ## Security
 
 - Config lives in `%APPDATA%\SCPDrop\config.json`. Passwords/passphrases are encrypted with Windows DPAPI
