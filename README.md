@@ -53,3 +53,7 @@ window that's already open, where they join the upload queue, and the new launch
 - Uses [SSH.NET](https://github.com/sshnet/SSH.NET). The remote must have `scp` installed and a POSIX shell
   (folder creation uses `mkdir -p`) — i.e. a normal Linux/macOS/BSD server.
 - Password auth also answers keyboard-interactive password prompts.
+
+## License
+
+[MIT](LICENSE)
