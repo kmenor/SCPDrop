@@ -80,8 +80,19 @@
                         <ColumnDefinition Width="Auto" SharedSizeGroup="Label" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
-                    <TextBlock Text="Password" Height="34" Padding="0,8,0,0" />
-                    <PasswordBox Grid.Column="1" x:Name="PasswordBox" VerticalAlignment="Center" />
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="34" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="Password" />
+                    <PasswordBox Grid.Column="1" x:Name="PasswordBox" VerticalAlignment="Center"
+                                 PasswordChanged="PasswordBox_PasswordChanged" />
+                    <TextBlock Grid.Row="1" Grid.Column="1" x:Name="PasswordWarning" Visibility="Collapsed"
+                               TextWrapping="Wrap" Foreground="Firebrick" FontSize="11" Margin="0,0,0,6">
+                        The saved password can't be decrypted (it was saved by another Windows user or computer).
+                        It's kept as is; type a new one to replace it, or
+                        <Hyperlink Click="RemovePassword_Click">remove it</Hyperlink>.
+                    </TextBlock>
                 </Grid>
 
                 <!-- Key auth -->
@@ -93,6 +104,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="34" />
                         <RowDefinition Height="34" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <TextBlock Text="Key file" />
                     <DockPanel Grid.Column="1" VerticalAlignment="Center">
@@ -101,7 +113,14 @@
                     </DockPanel>
                     <TextBlock Grid.Row="1" Text="Passphrase" />
                     <PasswordBox Grid.Row="1" Grid.Column="1" x:Name="PassphraseBox" VerticalAlignment="Center"
-                                 ToolTip="Leave blank if the key is not encrypted" />
+                                 ToolTip="Leave blank if the key is not encrypted"
+                                 PasswordChanged="PassphraseBox_PasswordChanged" />
+                    <TextBlock Grid.Row="2" Grid.Column="1" x:Name="PassphraseWarning" Visibility="Collapsed"
+                               TextWrapping="Wrap" Foreground="Firebrick" FontSize="11" Margin="0,0,0,6">
+                        The saved passphrase can't be decrypted (it was saved by another Windows user or computer).
+                        It's kept as is; type a new one to replace it, or
+                        <Hyperlink Click="RemovePassphrase_Click">remove it</Hyperlink>.
+                    </TextBlock>
                 </Grid>
 
                 <TextBlock Grid.Row="5" Text="Remote folder" />

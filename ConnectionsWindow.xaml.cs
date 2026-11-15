@@ -14,6 +14,8 @@ public partial class ConnectionsWindow : Window
 
     private RemoteConnection? _current;
     private bool _loading;
+    private bool _passwordEdited;
+    private bool _passphraseEdited;
 
     public ConnectionsWindow(List<RemoteConnection> connections, Guid? selectId)
     {
@@ -43,9 +45,15 @@ public partial class ConnectionsWindow : Window
         UserBox.Text = c.Username;
         PasswordRadio.IsChecked = c.Auth == AuthMethod.Password;
         KeyRadio.IsChecked = c.Auth == AuthMethod.PrivateKey;
-        PasswordBox.Password = Secret.Unprotect(c.EncryptedPassword);
+        // A secret that can't be decrypted is shown as empty with a warning, and left untouched on save
+        // unless the user types a replacement or removes it.
+        PasswordWarning.Visibility = Secret.TryUnprotect(c.EncryptedPassword, out var password) ? Visibility.Collapsed : Visibility.Visible;
+        PasswordBox.Password = password;
+        _passwordEdited = false;
         KeyPathBox.Text = c.PrivateKeyPath ?? "";
-        PassphraseBox.Password = Secret.Unprotect(c.EncryptedPassphrase);
+        PassphraseWarning.Visibility = Secret.TryUnprotect(c.EncryptedPassphrase, out var passphrase) ? Visibility.Collapsed : Visibility.Visible;
+        PassphraseBox.Password = passphrase;
+        _passphraseEdited = false;
         FolderBox.Text = c.RemoteFolder;
         CreateFolderCheck.IsChecked = c.CreateRemoteFolder;
         HostKeyBox.Text = c.HostKeyFingerprint ?? "(not yet trusted — you'll be asked on first connect)";
@@ -71,9 +79,10 @@ public partial class ConnectionsWindow : Window
         }
         c.Username = UserBox.Text.Trim();
         c.Auth = KeyRadio.IsChecked == true ? AuthMethod.PrivateKey : AuthMethod.Password;
-        c.EncryptedPassword = Secret.Protect(PasswordBox.Password);
+        // Secrets are only re-encrypted when the user actually changed them.
+        if (_passwordEdited) c.EncryptedPassword = Secret.Protect(PasswordBox.Password);
         c.PrivateKeyPath = string.IsNullOrWhiteSpace(KeyPathBox.Text) ? null : KeyPathBox.Text.Trim();
-        c.EncryptedPassphrase = Secret.Protect(PassphraseBox.Password);
+        if (_passphraseEdited) c.EncryptedPassphrase = Secret.Protect(PassphraseBox.Password);
         c.RemoteFolder = FolderBox.Text.Trim();
         c.CreateRemoteFolder = CreateFolderCheck.IsChecked == true;
     }
@@ -88,6 +97,34 @@ public partial class ConnectionsWindow : Window
     }
 
     private void Auth_Changed(object sender, RoutedEventArgs e) => UpdateAuthPanels();
+
+    private void PasswordBox_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        _passwordEdited = true;
+        PasswordWarning.Visibility = Visibility.Collapsed;
+    }
+
+    private void PassphraseBox_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        _passphraseEdited = true;
+        PassphraseWarning.Visibility = Visibility.Collapsed;
+    }
+
+    private void RemovePassword_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current == null) return;
+        _current.EncryptedPassword = null;
+        PasswordWarning.Visibility = Visibility.Collapsed;
+    }
+
+    private void RemovePassphrase_Click(object sender, RoutedEventArgs e)
+    {
+        if (_current == null) return;
+        _current.EncryptedPassphrase = null;
+        PassphraseWarning.Visibility = Visibility.Collapsed;
+    }
 
     private void UpdateAuthPanels()
     {

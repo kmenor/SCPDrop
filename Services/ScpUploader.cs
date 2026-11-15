@@ -280,13 +280,13 @@ public static class ScpUploader
             if (path.StartsWith("~"))
                 path = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + path[1..];
             if (!File.Exists(path)) throw new FileNotFoundException($"Private key file not found: {path}");
-            var pass = Secret.Unprotect(c.EncryptedPassphrase);
+            var pass = ReadSecret(c, c.EncryptedPassphrase, "key passphrase");
             var key = pass.Length > 0 ? new PrivateKeyFile(path, pass) : new PrivateKeyFile(path);
             methods.Add(new PrivateKeyAuthenticationMethod(user, key));
         }
         else
         {
-            pw = Secret.Unprotect(c.EncryptedPassword);
+            pw = ReadSecret(c, c.EncryptedPassword, "password");
             if (pw.Length > 0) methods.Add(new PasswordAuthenticationMethod(user, pw));
         }
 
@@ -354,6 +354,13 @@ public static class ScpUploader
             Timeout = TimeSpan.FromSeconds(20)
         };
     }
+
+    private static string ReadSecret(RemoteConnection c, string? encrypted, string what) =>
+        Secret.TryUnprotect(encrypted, out var plain)
+            ? plain
+            : throw new InvalidOperationException(
+                $"The saved {what} for '{c.Name}' can't be decrypted; it was probably saved by another Windows user " +
+                "or on another computer. Enter it again in Manage Connections.");
 
     private static bool LooksLikeOneTimeCode(string request)
     {

@@ -56,16 +56,23 @@ public static class Secret
             ? null
             : Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), Entropy, DataProtectionScope.CurrentUser));
 
-    public static string Unprotect(string? encrypted)
+    /// <summary>
+    /// Decrypts a saved secret. No saved secret gives true and "". A secret that is saved but can't be
+    /// decrypted (saved by another Windows user or on another computer, or corrupted) gives false, so callers
+    /// can tell it apart from an empty one instead of overwriting it.
+    /// </summary>
+    public static bool TryUnprotect(string? encrypted, out string plain)
     {
-        if (string.IsNullOrEmpty(encrypted)) return "";
+        plain = "";
+        if (string.IsNullOrEmpty(encrypted)) return true;
         try
         {
-            return Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(encrypted), Entropy, DataProtectionScope.CurrentUser));
+            plain = Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(encrypted), Entropy, DataProtectionScope.CurrentUser));
+            return true;
         }
-        catch
+        catch (Exception ex) when (ex is CryptographicException or FormatException)
         {
-            return "";
+            return false;
         }
     }
 }
