@@ -270,6 +270,9 @@ public static class ScpUploader
     {
         if (string.IsNullOrWhiteSpace(c.Host)) throw new InvalidOperationException("Host is not set.");
         if (string.IsNullOrWhiteSpace(c.Username)) throw new InvalidOperationException("Username is not set.");
+        // The editor won't save a bad port, but config.json can be edited by hand.
+        if (!RemoteConnection.IsValidPort(c.Port))
+            throw new InvalidOperationException($"Port {c.Port} for '{c.Name}' is invalid; set a port from 1 to 65535 in Manage Connections.");
         var user = c.Username.Trim();
 
         var methods = new List<AuthenticationMethod>();

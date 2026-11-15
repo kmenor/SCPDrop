@@ -35,6 +35,8 @@ public sealed class RemoteConnection
     public string TargetDisplay =>
         $"{Username}@{Host}{(Port == 22 ? "" : ":" + Port)}:{(string.IsNullOrWhiteSpace(RemoteFolder) ? "~" : RemoteFolder)}";
 
+    public static bool IsValidPort(int port) => port is >= 1 and <= 65535;
+
     public override string ToString() => Name;
 }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Windows;
 using System.Windows.Media;
 using Microsoft.Win32;
@@ -29,9 +30,34 @@ public partial class ConnectionsWindow : Window
     private void ConnectionList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_loading) return;
+        if (!PortIsValid())
+        {
+            // Stay on the connection with the bad port rather than silently keeping or replacing it.
+            _loading = true;
+            ConnectionList.SelectedItem = _current;
+            _loading = false;
+            return;
+        }
         Commit();
         _current = ConnectionList.SelectedItem as RemoteConnection;
         LoadForm(_current);
+    }
+
+    private static bool TryParsePort(string text, out int port) =>
+        int.TryParse(text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out port) && RemoteConnection.IsValidPort(port);
+
+    /// <summary>
+    /// Checks the port field of the connection being edited. Shows an error and returns false if it isn't
+    /// a whole number from 1 to 65535, so the caller can refuse to test, save or leave the connection.
+    /// </summary>
+    private bool PortIsValid()
+    {
+        if (_current == null || TryParsePort(PortBox.Text, out _)) return true;
+        MessageBox.Show(this, $"\"{PortBox.Text.Trim()}\" isn't a valid port. Enter a whole number from 1 to 65535 (SSH is usually 22).",
+            "Invalid port", MessageBoxButton.OK, MessageBoxImage.Warning);
+        PortBox.Focus();
+        PortBox.SelectAll();
+        return false;
     }
 
     private void LoadForm(RemoteConnection? c)
@@ -69,7 +95,8 @@ public partial class ConnectionsWindow : Window
         if (c == null) return;
         c.Name = NameBox.Text.Trim();
         var newHost = HostBox.Text.Trim();
-        var newPort = int.TryParse(PortBox.Text.Trim(), out var port) && port is > 0 and < 65536 ? port : 22;
+        // Callers check PortIsValid() first; an invalid entry never replaces the stored port.
+        var newPort = TryParsePort(PortBox.Text, out var port) ? port : c.Port;
         if (!string.Equals(newHost, c.Host, StringComparison.OrdinalIgnoreCase) || newPort != c.Port)
         {
             // A different server means the previously trusted key no longer applies.
@@ -137,7 +164,7 @@ public partial class ConnectionsWindow : Window
 
     private void Duplicate_Click(object sender, RoutedEventArgs e)
     {
-        if (_current == null) return;
+        if (_current == null || !PortIsValid()) return;
         Commit();
         var copy = ConfigStore.DeepClone(_current);
         copy.Id = Guid.NewGuid();
@@ -147,6 +174,7 @@ public partial class ConnectionsWindow : Window
 
     private void AddAndSelect(RemoteConnection c)
     {
+        if (!PortIsValid()) return;
         Commit();
         Connections.Add(c);
         ConnectionList.Items.Refresh();
@@ -189,6 +217,7 @@ public partial class ConnectionsWindow : Window
 
     private async void Test_Click(object sender, RoutedEventArgs e)
     {
+        if (!PortIsValid()) return;
         Commit();
         var live = _current;
         if (live == null) return;
@@ -239,6 +268,7 @@ public partial class ConnectionsWindow : Window
 
     private void Save_Click(object sender, RoutedEventArgs e)
     {
+        if (!PortIsValid()) return;
         Commit();
         foreach (var c in Connections)
         {
