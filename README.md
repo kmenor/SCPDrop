@@ -30,7 +30,9 @@ dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile
 - Dropping two items with the same name (e.g. `a\report.txt` and `b\report.txt`) is refused up front.
 
 **Remote folder**: absolute (`/srv/drop`) or home-relative (`uploads`, `~/uploads`); blank = home directory.
-With "Create remote folder" checked, `mkdir -p` runs before upload.
+With "Create remote folder" checked, `mkdir -p` creates the remote folder if needed. Unchecked, an upload stops
+before changing anything if the remote folder doesn't exist. Either way, folders you drop are always created inside
+it.
 
 **Send To menu** (optional): paths passed on the command line are uploaded to the last-selected connection on
 start. Put a shortcut to `SCPDrop.exe` in `shell:sendto` to get *Right-click → Send to → SCP Drop*.

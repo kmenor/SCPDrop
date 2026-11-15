@@ -72,6 +72,8 @@ public static class ScpUploader
         try
         {
             Connect(ssh, sshCheck, auth, ct);
+            if (!conn.CreateRemoteFolder && baseFolder.Length > 0)
+                RequireRemoteFolder(ssh, conn, baseFolder, ct);
             ConfirmDestinations(ssh, conn, plan, ui, ct);
 
             if (conn.CreateRemoteFolder && baseFolder.Length > 0)
@@ -147,6 +149,20 @@ public static class ScpUploader
             catch { /* best effort; stale temp files are also swept on later uploads */ }
             throw;
         }
+    }
+
+    /// <summary>
+    /// With "Create remote folder" off, the configured destination must already exist. Checked up front
+    /// because creating a dropped folder with mkdir -p would otherwise quietly create it as well.
+    /// Folders inside the upload are always created; they're part of what's being sent.
+    /// </summary>
+    private static void RequireRemoteFolder(SshClient ssh, RemoteConnection conn, string baseFolder, CancellationToken ct)
+    {
+        var r = Exec(ssh, $"test -d {ShellQuote(baseFolder)}", ct);
+        if (r.ExitStatus != 0)
+            throw new InvalidOperationException(
+                $"Nothing was uploaded: the remote folder '{conn.RemoteFolder}' doesn't exist, and \"Create remote folder\" " +
+                $"is off for '{conn.Name}'. Create the folder on the server, or turn the option on in Manage Connections.");
     }
 
     /// <summary>

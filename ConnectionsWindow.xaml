@@ -130,7 +130,8 @@
                            Text="e.g. /var/www/uploads or ~/incoming — blank uploads to the home directory" />
 
                 <CheckBox Grid.Row="7" Grid.Column="1" x:Name="CreateFolderCheck" VerticalAlignment="Center"
-                          Content="Create remote folder if it doesn't exist (mkdir -p)" />
+                          Content="Create the remote folder if it doesn't exist (mkdir -p)"
+                          ToolTip="Applies to the remote folder above. Folders you drop are always created inside it. When off, uploads stop if the remote folder is missing." />
 
                 <TextBlock Grid.Row="8" Text="Host key" Margin="0,6,10,0" VerticalAlignment="Top" />
                 <DockPanel Grid.Row="8" Grid.Column="1" Margin="0,4,0,0">
