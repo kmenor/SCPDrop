@@ -7,6 +7,19 @@ namespace SCPDrop.Services;
 
 public sealed record UploadProgress(string CurrentFile, long BytesDone, long BytesTotal);
 
+/// <summary>
+/// Outcome of an upload that ran to the end. Failures and cancellation are reported by exceptions instead.
+/// </summary>
+/// <param name="ItemsRequested">Items the user dropped or picked.</param>
+/// <param name="ItemsUploaded">Of those, items that were sent (a folder counts once).</param>
+/// <param name="FilesUploaded">Individual files sent, including those inside folders.</param>
+/// <param name="Skipped">Everything left out, dropped items and links inside folders alike.</param>
+public sealed record UploadResult(int ItemsRequested, int ItemsUploaded, int FilesUploaded, IReadOnlyList<string> Skipped)
+{
+    public bool Complete => Skipped.Count == 0 && ItemsUploaded == ItemsRequested;
+    public bool NothingUploaded => ItemsUploaded == 0;
+}
+
 /// <summary>User interaction needed while connecting. Methods may be called from a background thread.</summary>
 public interface IConnectionUi
 {
@@ -22,7 +35,7 @@ public interface IConnectionUi
 
 public static class ScpUploader
 {
-    public static Task UploadAsync(
+    public static Task<UploadResult> UploadAsync(
         RemoteConnection conn,
         IReadOnlyList<string> localPaths,
         IProgress<UploadProgress> progress,
@@ -34,6 +47,8 @@ public static class ScpUploader
         var plan = BuildPlan(localPaths, baseFolder, ct);
         foreach (var skipped in plan.Skipped) log("Skipped " + skipped);
         foreach (var item in plan.Items) log("Uploading " + item);
+        var result = new UploadResult(localPaths.Count, plan.Items.Count, plan.Files.Count, plan.Skipped);
+        if (plan.Items.Count == 0) return result; // nothing left to send; don't connect at all
         long total = plan.Files.Sum(f => f.Size);
         var auth = new AuthSession();
 
@@ -82,6 +97,7 @@ public static class ScpUploader
                 done += file.Size;
                 progress.Report(new UploadProgress(file.DisplayName, done, total));
             }
+            return result;
         }
         catch (Exception) when (ct.IsCancellationRequested)
         {

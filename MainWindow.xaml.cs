@@ -143,12 +143,29 @@ public partial class MainWindow : Window
             });
 
             var ui = new WpfConnectionUi(this, SaveConfig);
-            await ScpUploader.UploadAsync(conn, paths, progress, ui, msg => Dispatcher.Invoke(() => Log(msg)), _cts.Token);
+            var result = await ScpUploader.UploadAsync(conn, paths, progress, ui, msg => Dispatcher.Invoke(() => Log(msg)), _cts.Token);
 
-            Progress.Value = 100;
             var secs = (DateTime.Now - started).TotalSeconds;
-            StatusText.Text = $"Done: {label} → {conn.Name}";
-            Log($"✔ Completed {label} in {secs:0.0}s");
+            var files = $"{result.FilesUploaded} file{(result.FilesUploaded == 1 ? "" : "s")}";
+            if (result.NothingUploaded)
+            {
+                Progress.Value = 0;
+                StatusText.Text = $"Nothing uploaded: {label} (see log)";
+                Log($"✖ Nothing uploaded: all {result.ItemsRequested} item(s) were skipped");
+            }
+            else if (!result.Complete)
+            {
+                Progress.Value = 100;
+                StatusText.Text = $"Partly done: {result.ItemsUploaded} of {result.ItemsRequested} item(s) → {conn.Name}, " +
+                                  $"{result.Skipped.Count} skipped (see log)";
+                Log($"⚠ Partly completed {label} in {secs:0.0}s: {files} uploaded, {result.Skipped.Count} skipped");
+            }
+            else
+            {
+                Progress.Value = 100;
+                StatusText.Text = $"Done: {label} → {conn.Name}";
+                Log($"✔ Completed {label} in {secs:0.0}s ({files})");
+            }
         }
         catch (OperationCanceledException)
         {
