@@ -1,0 +1,203 @@
+using System.Windows;
+using System.Windows.Media;
+using Microsoft.Win32;
+using SCPDrop.Models;
+using SCPDrop.Services;
+
+namespace SCPDrop;
+
+public partial class MainWindow : Window
+{
+    private AppConfig _config;
+    private readonly SemaphoreSlim _uploadGate = new(1, 1);
+    private CancellationTokenSource? _cts;
+    private int _queued;
+    private bool _loading;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        _config = ConfigStore.Load();
+        _loading = true;
+        TopmostCheck.IsChecked = _config.AlwaysOnTop;
+        Topmost = _config.AlwaysOnTop;
+        _loading = false;
+        RefreshConnections();
+        Log($"Config: {ConfigStore.FilePath}");
+
+        // Paths passed on the command line (e.g. via a shortcut in shell:sendto) are uploaded on start.
+        var args = Environment.GetCommandLineArgs().Skip(1).Where(a => File.Exists(a) || Directory.Exists(a)).ToArray();
+        if (args.Length > 0) Loaded += async (_, _) => await UploadAsync(args);
+    }
+
+    private RemoteConnection? Selected => ConnectionCombo.SelectedItem as RemoteConnection;
+
+    private void RefreshConnections()
+    {
+        _loading = true;
+        ConnectionCombo.ItemsSource = null;
+        ConnectionCombo.ItemsSource = _config.Connections;
+        ConnectionCombo.SelectedItem =
+            _config.Connections.FirstOrDefault(c => c.Id == _config.LastSelectedId) ?? _config.Connections.FirstOrDefault();
+        _loading = false;
+        UpdateTarget();
+    }
+
+    private void UpdateTarget()
+    {
+        var c = Selected;
+        TargetText.Text = c?.TargetDisplay ?? "No connection configured — click Manage… to add one.";
+        var enabled = c != null;
+        DropZone.Opacity = enabled ? 1.0 : 0.6;
+        BrowseFilesButton.IsEnabled = BrowseFolderButton.IsEnabled = enabled;
+    }
+
+    private void ConnectionCombo_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_loading) return;
+        _config.LastSelectedId = Selected?.Id;
+        SaveConfig();
+        UpdateTarget();
+    }
+
+    private void Manage_Click(object sender, RoutedEventArgs e)
+    {
+        var win = new ConnectionsWindow(_config.Connections, Selected?.Id) { Owner = this };
+        if (win.ShowDialog() != true) return;
+        _config.Connections = win.Connections;
+        if (win.SelectedId != null) _config.LastSelectedId = win.SelectedId;
+        SaveConfig();
+        RefreshConnections();
+    }
+
+    // ---- Drag & drop ----
+
+    private void DropZone_DragOver(object sender, DragEventArgs e)
+    {
+        var ok = e.Data.GetDataPresent(DataFormats.FileDrop) && Selected != null;
+        e.Effects = ok ? DragDropEffects.Copy : DragDropEffects.None;
+        if (ok)
+        {
+            DropZone.Background = new SolidColorBrush(Color.FromRgb(0xE3, 0xEE, 0xFB));
+            DropBorder.Stroke = new SolidColorBrush(Color.FromRgb(0x2F, 0x6F, 0xC9));
+        }
+        e.Handled = true;
+    }
+
+    private void DropZone_DragLeave(object sender, DragEventArgs e) => ResetDropZone();
+
+    private void ResetDropZone()
+    {
+        DropZone.Background = new SolidColorBrush(Color.FromRgb(0xF7, 0xF9, 0xFC));
+        DropBorder.Stroke = new SolidColorBrush(Color.FromRgb(0x8A, 0xA4, 0xC8));
+    }
+
+    private async void DropZone_Drop(object sender, DragEventArgs e)
+    {
+        ResetDropZone();
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] paths && paths.Length > 0)
+            await UploadAsync(paths);
+    }
+
+    private async void BrowseFiles_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog { Multiselect = true, Title = "Select files to upload" };
+        if (dlg.ShowDialog(this) == true) await UploadAsync(dlg.FileNames);
+    }
+
+    private async void BrowseFolder_Click(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFolderDialog { Multiselect = true, Title = "Select folders to upload" };
+        if (dlg.ShowDialog(this) == true) await UploadAsync(dlg.FolderNames);
+    }
+
+    // ---- Upload ----
+
+    private async Task UploadAsync(IReadOnlyList<string> paths)
+    {
+        var conn = Selected;
+        if (conn == null)
+        {
+            MessageBox.Show(this, "Add a connection first (Manage…).", "SCP Drop", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var label = paths.Count == 1 ? Path.GetFileName(paths[0].TrimEnd('\\')) : $"{paths.Count} items";
+        if (Interlocked.Increment(ref _queued) > 1) Log($"Queued {label} for {conn.Name}");
+
+        await _uploadGate.WaitAsync();
+        _cts = new CancellationTokenSource();
+        SetBusy(true);
+        var started = DateTime.Now;
+        try
+        {
+            Log($"Sending {label} to {conn.Name} ({conn.TargetDisplay})");
+            StatusText.Text = $"Connecting to {conn.Host}…";
+            Progress.Value = 0;
+
+            var progress = new Progress<UploadProgress>(p =>
+            {
+                Progress.Value = p.BytesTotal > 0 ? 100.0 * p.BytesDone / p.BytesTotal : 0;
+                StatusText.Text = $"{p.CurrentFile} — {ScpUploader.FormatBytes(p.BytesDone)} / {ScpUploader.FormatBytes(p.BytesTotal)}";
+            });
+
+            var ui = new WpfConnectionUi(this, SaveConfig);
+            await ScpUploader.UploadAsync(conn, paths, progress, ui, msg => Dispatcher.Invoke(() => Log(msg)), _cts.Token);
+
+            Progress.Value = 100;
+            var secs = (DateTime.Now - started).TotalSeconds;
+            StatusText.Text = $"Done: {label} → {conn.Name}";
+            Log($"✔ Completed {label} in {secs:0.0}s");
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText.Text = "Cancelled.";
+            Log("✖ Cancelled");
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = "Failed: " + ex.Message;
+            Log("✖ Error: " + ex.Message);
+        }
+        finally
+        {
+            _cts.Dispose();
+            _cts = null;
+            Interlocked.Decrement(ref _queued);
+            SetBusy(_queued > 0);
+            _uploadGate.Release();
+        }
+    }
+
+    private void SetBusy(bool busy)
+    {
+        CancelButton.IsEnabled = busy;
+        ManageButton.IsEnabled = !busy;
+        ConnectionCombo.IsEnabled = !busy;
+    }
+
+    private void Cancel_Click(object sender, RoutedEventArgs e) => _cts?.Cancel();
+
+    // ---- Misc ----
+
+    private void Topmost_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_loading) return;
+        Topmost = _config.AlwaysOnTop = TopmostCheck.IsChecked == true;
+        SaveConfig();
+    }
+
+    private void ClearLog_Click(object sender, RoutedEventArgs e) => LogBox.Clear();
+
+    private void Log(string message)
+    {
+        LogBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
+        LogBox.ScrollToEnd();
+    }
+
+    private void SaveConfig()
+    {
+        try { ConfigStore.Save(_config); }
+        catch (Exception ex) { Log("Could not save config: " + ex.Message); }
+    }
+}
