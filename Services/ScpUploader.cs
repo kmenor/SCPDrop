@@ -234,11 +234,16 @@ public static class ScpUploader
         }
     }
 
-    /// <summary>Shared across the connections of one operation so the user isn't asked the same thing twice.</summary>
+    /// <summary>Shared across the connections of one operation.</summary>
     private sealed class AuthSession
     {
         public readonly object Lock = new();
+
+        /// <summary>Typed answers to password-style prompts, reused so the user isn't asked twice.</summary>
         public readonly Dictionary<string, string> Answers = new();
+
+        /// <summary>Every prompt the user has answered, reusable or not.</summary>
+        public readonly HashSet<string> Asked = new();
         public readonly List<string> PromptsSeen = new();
         public bool UserCancelled;
         public bool UserAnswered;
@@ -288,8 +293,12 @@ public static class ScpUploader
                     continue;
                 }
 
-                string? cached;
-                lock (session.Lock) session.Answers.TryGetValue(request, out cached);
+                // Only password-style answers are reused for the operation's other connection; anything else
+                // (2FA codes, tokens, unknown challenges) may be single-use and is asked for again.
+                var reusable = IsReusableSecretPrompt(request, p.IsEchoed);
+                string? cached = null;
+                if (reusable)
+                    lock (session.Lock) session.Answers.TryGetValue(request, out cached);
                 if (cached != null && cachedUsed.Add(request))
                 {
                     p.Response = cached;
@@ -298,11 +307,26 @@ public static class ScpUploader
 
                 if (session.UserCancelled) { p.Response = ""; continue; }
 
-                var answer = ui.Ask(c, e.Instruction ?? "", request, p.IsEchoed);
+                bool askedBefore;
+                lock (session.Lock) askedBefore = session.Asked.Contains(request);
+                var instruction = e.Instruction ?? "";
+                if (askedBefore && !reusable)
+                    instruction = "This upload logs in a second time, and one-time codes can't be reused. " +
+                                  "Enter a new code." + (instruction.Length > 0 ? "\n\n" + instruction : "");
+
+                var answer = ui.Ask(c, instruction, request, p.IsEchoed);
                 lock (session.Lock)
                 {
-                    if (answer == null) session.UserCancelled = true;
-                    else { session.Answers[request] = answer; session.UserAnswered = true; }
+                    if (answer == null)
+                    {
+                        session.UserCancelled = true;
+                    }
+                    else
+                    {
+                        session.Asked.Add(request);
+                        if (reusable) session.Answers[request] = answer;
+                        session.UserAnswered = true;
+                    }
                 }
                 p.Response = answer ?? "";
             }
@@ -319,6 +343,14 @@ public static class ScpUploader
     {
         var r = request.ToLowerInvariant();
         return r.Contains("code") || r.Contains("token") || r.Contains("verification") || r.Contains("otp") || r.Contains("one-time");
+    }
+
+    /// <summary>A hidden prompt that asks for a password or passphrase, which stays valid for a second login.</summary>
+    internal static bool IsReusableSecretPrompt(string request, bool echoed)
+    {
+        if (echoed || LooksLikeOneTimeCode(request)) return false;
+        var r = request.ToLowerInvariant();
+        return r.Contains("password") || r.Contains("passphrase");
     }
 
     private sealed class HostKeyCheck
