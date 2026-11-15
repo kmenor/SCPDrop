@@ -14,7 +14,7 @@
         </Grid.RowDefinitions>
 
         <!-- Connection list -->
-        <DockPanel Grid.Column="0" Margin="0,0,12,0">
+        <DockPanel x:Name="ListPanel" Grid.Column="0" Margin="0,0,12,0">
             <UniformGrid DockPanel.Dock="Bottom" Columns="3" Margin="0,8,0,0">
                 <Button Content="Add" MinWidth="0" Margin="0,0,4,0" Click="Add_Click" />
                 <Button Content="Copy" MinWidth="0" Margin="2,0" Click="Duplicate_Click" />
@@ -128,7 +128,7 @@
         </ScrollViewer>
 
         <StackPanel Grid.Row="1" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
-            <Button Content="Save" IsDefault="True" Margin="0,0,8,0" Click="Save_Click" />
+            <Button x:Name="SaveButton" Content="Save" IsDefault="True" Margin="0,0,8,0" Click="Save_Click" />
             <Button Content="Cancel" IsCancel="True" />
         </StackPanel>
     </Grid>

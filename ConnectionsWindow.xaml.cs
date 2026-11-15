@@ -153,28 +153,52 @@ public partial class ConnectionsWindow : Window
     private async void Test_Click(object sender, RoutedEventArgs e)
     {
         Commit();
-        var c = _current;
-        if (c == null) return;
-        TestButton.IsEnabled = false;
+        var live = _current;
+        if (live == null) return;
+
+        // Test a frozen copy so the background connection never sees edits made meanwhile, and a host key
+        // trusted during the test can't be stored on a profile that now points somewhere else.
+        var snapshot = ConfigStore.DeepClone(live);
+        SetTesting(true);
         TestResultText.Foreground = Brushes.Black;
-        TestResultText.Text = $"Connecting to {c.Host}:{c.Port}…";
+        TestResultText.Text = $"Connecting to {snapshot.Host}:{snapshot.Port}…";
+        Brush color;
+        string text;
         try
         {
-            var result = await Task.Run(() => ScpUploader.Test(c, new WpfConnectionUi(this)));
-            TestResultText.Foreground = Brushes.DarkGreen;
-            TestResultText.Text = "✔ " + result;
+            var result = await Task.Run(() => ScpUploader.Test(snapshot, new WpfConnectionUi(this)));
+            color = Brushes.DarkGreen;
+            text = "✔ " + result;
         }
         catch (Exception ex)
         {
-            TestResultText.Foreground = Brushes.Firebrick;
-            TestResultText.Text = "✖ " + ex.Message;
+            color = Brushes.Firebrick;
+            text = "✖ " + ex.Message;
         }
-        finally
+
+        if (snapshot.HostKeyFingerprint != null && live.HostKeyFingerprint == null && SameEndpoint(live, snapshot))
+            live.HostKeyFingerprint = snapshot.HostKeyFingerprint;
+        SetTesting(false);
+
+        // Only show the result against the profile that was actually tested.
+        if (_current == live && SameEndpoint(live, snapshot))
         {
-            HostKeyBox.Text = c.HostKeyFingerprint ?? "(not yet trusted — you'll be asked on first connect)";
-            TestButton.IsEnabled = true;
+            TestResultText.Foreground = color;
+            TestResultText.Text = text;
+            HostKeyBox.Text = live.HostKeyFingerprint ?? "(not yet trusted — you'll be asked on first connect)";
         }
     }
+
+    /// <summary>Locks selection, editing and Save while a connection test is running.</summary>
+    private void SetTesting(bool testing)
+    {
+        ListPanel.IsEnabled = !testing;
+        FormPanel.IsEnabled = !testing && _current != null;
+        SaveButton.IsEnabled = !testing;
+    }
+
+    private static bool SameEndpoint(RemoteConnection a, RemoteConnection b) =>
+        string.Equals(a.Host, b.Host, StringComparison.OrdinalIgnoreCase) && a.Port == b.Port;
 
     private void Save_Click(object sender, RoutedEventArgs e)
     {
